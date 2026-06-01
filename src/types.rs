@@ -6,6 +6,10 @@ pub struct MemoryRegion {
     pub perms: Permissions,
     pub region_type: RegionType,
     pub label: String,
+    //actual physical memory usage
+    pub rss: u64,
+    pub pss: u64,
+    pub private_dirty: u64,
 }
 
 #[derive(Debug, Clone)]
