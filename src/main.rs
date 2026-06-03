@@ -1,22 +1,26 @@
+mod app;
 mod parser;
 mod types;
+mod ui;
 
 use anyhow::Result;
+use app::App;
 use clap::Parser;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use std::io;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "memtrace", about = "Inspect memory layout of a running process")]
 struct Args {
     /// PID of the process to inspect
     pid: u32,
-
-    /// Watch mode — refresh every N seconds
-    #[arg(short, long)]
-    watch: bool,
 
     /// Refresh interval in seconds (default: 2)
     #[arg(short, long, default_value_t = 2)]
@@ -26,95 +30,65 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.watch {
-        run_watch_mode(args.pid, args.interval)?;
-    } else {
-        print_snapshot(args.pid)?;
-    }
+    // Set up terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-    Ok(())
+    let result = run_app(&mut terminal, args.pid, args.interval);
+
+    // Always restore terminal even if we crashed
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    result
 }
 
-fn run_watch_mode(pid: u32, interval: u64) -> Result<()> {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = Arc::clone(&running);
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    pid: u32,
+    interval: u64,
+) -> Result<()> {
+    let mut app = App::new(pid);
+    app.refresh(); // initial load
 
-    // Register Ctrl+C handler
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Failed to set Ctrl+C handler");
+    let refresh_interval = Duration::from_secs(interval);
+    let mut last_refresh = Instant::now();
 
-    println!("Watching PID {} — refreshing every {}s. Press Ctrl+C to stop.\n", pid, interval);
 
-    while running.load(Ordering::SeqCst) {
-        // Clear the terminal screen
-        print!("\x1B[2J\x1B[H");
+    loop {
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
-        match print_snapshot(pid) {
-            Ok(_)  => {}
-            Err(e) => {
-                // Process likely exited
-                println!("Process ended or unreadable: {}", e);
-                break;
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                // KeyEventKind::Press check prevents double-firing on Windows/WSL
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+                        KeyCode::Up   | KeyCode::Char('k') => app.scroll_up(),
+                        KeyCode::Char('r') => {
+                            app.refresh();
+                            last_refresh = Instant::now();
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
 
+        if app.should_quit {
+            break;
+        }
 
-        let chunks = interval * 10;
-        for _ in 0..chunks {
-            if !running.load(Ordering::SeqCst) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
+
+        if last_refresh.elapsed() >= refresh_interval {
+            app.refresh();
+            last_refresh = Instant::now();
         }
     }
-
-    println!("\nStopped.");
-    Ok(())
-}
-
-fn print_snapshot(pid: u32) -> Result<()> {
-    let regions = parser::parse_maps(pid)?;
-
-    println!(
-        "{:<16}  {:>8}  {:>8}  {:>8}  {:>13}  {:<6}  {}",
-        "ADDRESS", "VIRT", "RSS", "PSS", "PRIVATE_DIRTY", "PERMS", "LABEL"
-    );
-    println!("{}", "-".repeat(85));
-
-    for r in &regions {
-        let perms = format!(
-            "{}{}{}{}",
-            if r.perms.read    { "r" } else { "-" },
-            if r.perms.write   { "w" } else { "-" },
-            if r.perms.execute { "x" } else { "-" },
-            if r.perms.shared  { "s" } else { "p" },
-        );
-        let suspicious = if r.perms.is_suspicious() { " ⚠ RWX" } else { "" };
-
-        println!(
-            "{:#016x}  {:>6} KB  {:>6} KB  {:>6} KB  {:>11} KB  {:<6}  {}{}",
-            r.start,
-            r.size / 1024,
-            r.rss,
-            r.pss,
-            r.private_dirty,
-            perms,
-            r.label,
-            suspicious
-        );
-    }
-
-    let total_rss: u64     = regions.iter().map(|r| r.rss).sum();
-    let total_private: u64 = regions.iter().map(|r| r.private_dirty).sum();
-    let suspicious_count   = regions.iter().filter(|r| r.perms.is_suspicious()).count();
-
-    println!("{}", "-".repeat(85));
-    println!("Total regions:        {}", regions.len());
-    println!("Total RSS:            {} KB", total_rss);
-    println!("Total Private Dirty:  {} KB", total_private);
-    println!("Suspicious (rwx):     {}", suspicious_count);
 
     Ok(())
 }
